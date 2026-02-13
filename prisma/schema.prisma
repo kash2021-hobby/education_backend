@@ -1,0 +1,284 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+/// Roles for application users (counselors/admins, etc.)
+enum UserRole {
+  SUPER_ADMIN
+  COUNSELOR
+  VIEWER
+}
+
+/// Lead status lifecycle in CRM
+enum LeadStatus {
+  NEW
+  CONTACTED
+  INTERESTED
+  COLD
+  REJECTED
+  LOST
+  CONVERTED
+}
+
+/// Activity types for lead timeline
+enum LeadActivityType {
+  NOTE
+  STATUS_CHANGE
+  CALL_LOG
+  SYSTEM_LOG
+}
+
+/// Batch lifecycle statuses
+enum BatchStatus {
+  OPEN
+  FULL
+  IN_PROGRESS
+  COMPLETED
+}
+
+/// Student lifecycle statuses
+enum StudentStatus {
+  ACTIVE
+  DROPPED
+  ALUMNI
+}
+
+/// Payment methods
+enum PaymentMethod {
+  STRIPE
+  RAZORPAY
+  CASH
+  BANK_TRANSFER
+}
+
+/// Payment statuses
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
+
+/// Attendance statuses
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  EXCUSED
+}
+
+model User {
+  id                   String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  fullName             String    @db.VarChar(100)
+  email                String    @unique @db.VarChar(150)
+  passwordHash         String
+  role                 UserRole
+  isActive             Boolean   @default(true)
+  assignmentAvailable  Boolean   @default(true)
+  lastLeadAssignedAt   DateTime? @db.Timestamp(6)
+
+  // Relations
+  assignedLeads        Lead[]    @relation("UserAssignedLeads")
+  leadActivities       LeadActivity[] @relation("UserLeadActivities")
+  taughtSessions       AttendanceSession[] @relation("UserTaughtSessions")
+  students             Student[]
+
+  @@map("users")
+}
+
+model Lead {
+  id               String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  fullName         String        @db.VarChar(100)
+  email            String?       @db.VarChar(150)
+  phoneCountryCode String        @default("+91") @db.VarChar(5)
+  phoneNumber      String        @db.VarChar(15)
+  courseInterest   String?       @db.VarChar(50)
+  source           String        @default("WEBSITE") @db.VarChar(50)
+  status           LeadStatus
+  retryCount       Int           @default(0)
+  assignedToId     String?       @db.Uuid
+  createdAt        DateTime      @default(now()) @db.Timestamp(6)
+  updatedAt        DateTime      @default(now()) @db.Timestamp(6)
+
+  // Relations
+  assignedTo       User?         @relation("UserAssignedLeads", fields: [assignedToId], references: [id])
+  activities       LeadActivity[]
+  student          Student?
+  payments         Payment[]
+
+  @@index([email], name: "idx_lead_email")
+  @@index([phoneNumber], name: "idx_lead_phone")
+  @@map("leads")
+}
+
+model LeadActivity {
+  id           String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  leadId       String           @db.Uuid
+  actorId      String?          @db.Uuid
+  activityType LeadActivityType
+  description  String?
+  metadata     Json?
+  createdAt    DateTime         @default(now()) @db.Timestamp(6)
+
+  // Relations
+  lead         Lead             @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  actor        User?            @relation("UserLeadActivities", fields: [actorId], references: [id])
+
+  @@map("lead_activities")
+}
+
+model Course {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String   @db.VarChar(150)
+  code      String   @unique @db.VarChar(20)
+  baseFee   Decimal  @db.Decimal(10, 2)
+  isActive  Boolean  @default(true)
+
+  // Relations
+  batches   Batch[]
+
+  @@map("courses")
+}
+
+model Batch {
+  id                 String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  courseId           String      @db.Uuid
+  name               String      @db.VarChar(50)
+  startDate          DateTime    @db.Date
+  maxSeats           Int
+  currentEnrollment  Int         @default(0)
+  status             BatchStatus
+
+  // Relations
+  course             Course      @relation(fields: [courseId], references: [id])
+  students           Student[]
+  attendanceSessions AttendanceSession[]
+  exams              Exam[]
+
+  @@map("batches")
+}
+
+model Student {
+  id               String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String             @db.Uuid
+  leadId           String             @unique @db.Uuid
+  batchId          String             @db.Uuid
+  enrollmentNumber String             @unique @db.VarChar(50)
+  enrollmentDate   DateTime           @default(now()) @db.Timestamp(6)
+  status           StudentStatus
+
+  // Relations
+  user             User               @relation(fields: [userId], references: [id])
+  lead             Lead               @relation(fields: [leadId], references: [id])
+  batch            Batch              @relation(fields: [batchId], references: [id])
+  attendance       AttendanceRecord[]
+  examResults      ExamResult[]
+  telegramMapping  TelegramMapping?
+
+  @@map("students")
+}
+
+model Payment {
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  leadId         String        @db.Uuid
+  amount         Decimal       @db.Decimal(10, 2)
+  currency       String        @default("USD") @db.VarChar(3)
+  paymentMethod  PaymentMethod
+  transactionRef String        @unique @db.VarChar(100)
+  status         PaymentStatus
+  invoiceUrl     String?
+  createdAt      DateTime      @default(now()) @db.Timestamp(6)
+
+  // Relations
+  lead           Lead          @relation(fields: [leadId], references: [id])
+
+  @@map("payments")
+}
+
+model AttendanceSession {
+  id         String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  batchId    String             @db.Uuid
+  teacherId  String             @db.Uuid
+  date       DateTime           @db.Date
+  subject    String             @db.VarChar(100)
+  startTime  DateTime           @db.Time(6)
+  endTime    DateTime           @db.Time(6)
+  createdAt  DateTime           @default(now()) @db.Timestamp(6)
+
+  // Relations
+  batch      Batch              @relation(fields: [batchId], references: [id])
+  teacher    User               @relation("UserTaughtSessions", fields: [teacherId], references: [id])
+  records    AttendanceRecord[]
+
+  @@index([date], name: "idx_att_date")
+  @@map("attendance_sessions")
+}
+
+model AttendanceRecord {
+  id         String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sessionId  String           @db.Uuid
+  studentId  String           @db.Uuid
+  status     AttendanceStatus @default(PRESENT)
+
+  // Relations
+  session    AttendanceSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  student    Student           @relation(fields: [studentId], references: [id])
+
+  @@unique([sessionId, studentId], name: "attendance_session_student_unique")
+  @@map("attendance_records")
+}
+
+model Exam {
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  batchId     String       @db.Uuid
+  name        String       @db.VarChar(100)
+  maxMarks    Int
+  date        DateTime     @db.Date
+  isPublished Boolean      @default(false)
+
+  // Relations
+  batch       Batch        @relation(fields: [batchId], references: [id])
+  results     ExamResult[]
+
+  @@map("exams")
+}
+
+model ExamResult {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  examId        String   @db.Uuid
+  studentId     String   @db.Uuid
+  marksObtained Decimal  @db.Decimal(5, 2)
+  remarks       String?
+
+  // Relations
+  exam          Exam     @relation(fields: [examId], references: [id])
+  student       Student  @relation(fields: [studentId], references: [id])
+
+  @@map("exam_results")
+}
+
+model TelegramMapping {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  studentId        String   @unique @db.Uuid
+  chatId           BigInt?  @unique
+  username         String?  @db.VarChar(100)
+  verificationToken String? @db.VarChar(64)
+  tokenExpiresAt   DateTime?
+  isActive         Boolean  @default(true)
+
+  // Relations
+  student          Student  @relation(fields: [studentId], references: [id])
+
+  @@map("telegram_mappings")
+}
+
