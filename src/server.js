@@ -7,6 +7,7 @@ const mysql = require('mysql2/promise');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const { createMockPool, seedDefaultUser } = require('./memory-db');
 
 const app = express();
 
@@ -19,27 +20,80 @@ function sanitizePhone(phone) {
   return String(phone).replace(/\D/g, '');
 }
 
-// Simple MySQL pool using explicit DB_* env vars
-let pool;
-try {
-  if (!process.env.DB_HOST) {
-    // eslint-disable-next-line no-console
-    console.warn('DB_* env vars are not set. DB access will fail until they are configured.');
-  } else {
-    pool = mysql.createPool({
-      host: process.env.DB_HOST,
-      port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 3306,
-      user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD,
-      database: process.env.DB_NAME,
-      waitForConnections: true,
-      connectionLimit: 10,
-      queueLimit: 0,
-    });
+// Use in-memory DB when MySQL is unreachable (set USE_IN_MEMORY_DB=true)
+const USE_IN_MEMORY_DB = process.env.USE_IN_MEMORY_DB === 'true' || process.env.USE_IN_MEMORY_DB === '1';
+
+async function initFeeTables(p) {
+  try {
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS fee_schedules (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        student_id VARCHAR(36) NOT NULL,
+        lead_id VARCHAR(36) NOT NULL,
+        total_amount DECIMAL(12,2) NOT NULL,
+        plan_type ENUM('FULL','MONTHLY','INSTALLMENT_6') NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX (student_id),
+        INDEX (lead_id)
+      )
+    `);
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS fee_installments (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        schedule_id INT NOT NULL,
+        installment_no INT NOT NULL,
+        due_date DATE NOT NULL,
+        amount_due DECIMAL(12,2) NOT NULL,
+        status ENUM('PENDING','PAID') DEFAULT 'PENDING',
+        paid_at TIMESTAMP NULL,
+        payment_id VARCHAR(36) NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX (schedule_id),
+        INDEX (status)
+      )
+    `);
+    console.log('Fee schedule tables ready.');
+  } catch (e) {
+    console.error('Failed to init fee tables:', e.message);
   }
-} catch (e) {
+}
+
+let pool;
+if (USE_IN_MEMORY_DB) {
+  pool = createMockPool();
+  seedDefaultUser().catch((e) => console.error('Failed to seed in-memory DB', e));
   // eslint-disable-next-line no-console
-  console.error('Failed to initialize MySQL pool from DB_* env vars', e);
+  console.log('Using in-memory database (USE_IN_MEMORY_DB=true). Data is lost on restart.');
+} else {
+  try {
+    if (!process.env.DB_HOST) {
+      // eslint-disable-next-line no-console
+      console.warn('DB_* env vars are not set. DB access will fail until they are configured.');
+    } else {
+      pool = mysql.createPool({
+        host: process.env.DB_HOST.trim(),
+        port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 3306,
+        user: process.env.DB_USER,
+        password: process.env.DB_PASSWORD,
+        database: process.env.DB_NAME,
+        waitForConnections: true,
+        connectionLimit: 1,
+        queueLimit: 0,
+        connectTimeout: 60000,
+        enableKeepAlive: true,
+        ssl: false,
+      });
+      pool.query('SELECT 1')
+        .then(() => {
+          console.log('Database connected successfully.');
+          return initFeeTables(pool);
+        })
+        .catch((e) => console.error('Database connection test failed:', e.code || e.errno, e.message || String(e)));
+    }
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to initialize MySQL pool from DB_* env vars', e);
+  }
 }
 
 // Health check
@@ -224,6 +278,15 @@ app.post('/api/v1/leads/ingest', async (req, res) => {
 
   const rawPhone = payload.phone || payload.phone_number;
   const rawEmail = payload.email;
+  const feePlanType = ['FULL', 'MONTHLY', 'INSTALLMENT_6'].includes(payload.feePlanType)
+    ? payload.feePlanType
+    : 'FULL';
+  const totalFeeForSchedule = payload.totalFee != null && Number(payload.totalFee) > 0
+    ? Number(payload.totalFee)
+    : null;
+  const emergencyContactNumber = payload.emergencyContactNumber != null
+    ? String(payload.emergencyContactNumber).trim() || null
+    : (payload.emergency_contact_number != null ? String(payload.emergency_contact_number).trim() || null : null);
 
   const cleanPhone = sanitizePhone(rawPhone);
   const cleanEmail = rawEmail ? String(rawEmail).toLowerCase().trim() : null;
@@ -310,14 +373,27 @@ app.post('/api/v1/leads/ingest', async (req, res) => {
       });
     }
 
-    // 2. Round-robin counselor selection
-    const [assignees] = await conn.query(
-      `SELECT * FROM users
-       WHERE role = 'COUNSELOR' AND assignment_available = 1
-       ORDER BY (last_lead_assigned_at IS NULL) DESC, last_lead_assigned_at ASC
-       LIMIT 1`,
-    );
-    const assignee = assignees.length > 0 ? assignees[0] : null;
+    // 2. Counselor: use assigned_to from payload if valid, else round-robin
+    let assignee = null;
+    const requestedAssigneeId = payload.assigned_to || payload.assignedTo || payload.counselor_id || payload.counselorId;
+    if (requestedAssigneeId) {
+      const [userRows] = await conn.query(
+        `SELECT * FROM users WHERE id = ? AND is_active = 1 LIMIT 1`,
+        [requestedAssigneeId],
+      );
+      if (userRows.length > 0) {
+        assignee = userRows[0];
+      }
+    }
+    if (!assignee) {
+      const [assignees] = await conn.query(
+        `SELECT * FROM users
+         WHERE role = 'COUNSELOR' AND assignment_available = 1
+         ORDER BY (last_lead_assigned_at IS NULL) DESC, last_lead_assigned_at ASC
+         LIMIT 1`,
+      );
+      assignee = assignees.length > 0 ? assignees[0] : null;
+    }
 
     // 3. Create new lead
     const leadId = crypto.randomUUID();
@@ -480,6 +556,40 @@ app.get('/api/v1/leads/:id', async (req, res) => {
     // eslint-disable-next-line no-console
     console.error('Get lead detail failed', err);
     return res.status(500).json({ error: 'Failed to fetch lead detail' });
+  }
+});
+
+// Update lead (e.g. assign counselor)
+app.patch('/api/v1/leads/:id', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized. Check DB_* env vars.' });
+  }
+  const { id } = req.params;
+  const { assignedTo } = req.body || {};
+  try {
+    const [rows] = await pool.query('SELECT id FROM leads WHERE id = ? LIMIT 1', [id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    if (assignedTo !== undefined) {
+      const assigneeId = assignedTo === '' || assignedTo === null ? null : assignedTo;
+      if (assigneeId !== null) {
+        const [users] = await pool.query('SELECT id FROM users WHERE id = ? AND is_active = 1 LIMIT 1', [assigneeId]);
+        if (users.length === 0) {
+          return res.status(400).json({ error: 'Invalid counselor / user not found' });
+        }
+      }
+      await pool.query('UPDATE leads SET assigned_to = ?, updated_at = NOW() WHERE id = ?', [assigneeId, id]);
+    }
+    const [updated] = await pool.query(
+      `SELECT l.*, u.full_name AS counselor_name FROM leads l LEFT JOIN users u ON l.assigned_to = u.id WHERE l.id = ?`,
+      [id],
+    );
+    return res.json(updated[0]);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('Update lead failed', err);
+    return res.status(500).json({ error: 'Failed to update lead' });
   }
 });
 
@@ -707,15 +817,21 @@ async function generateEnrollmentNumber(conn, courseCode) {
 }
 
 // Enrollment conversion (Module 2: Enrollment Bridge) - simplified without real gateway
+// Accepts either batchId (single) or courseIds (array). With courseIds, one batch per course is chosen and one student created per course.
 app.post('/api/v1/enrollment/convert', async (req, res) => {
   if (!pool) {
     return res.status(500).json({ error: 'Database pool not initialized. Check DB_* env vars.' });
   }
 
-  const { leadId, batchId, payment } = req.body || {};
+  const { leadId, batchId, courseIds, payment, batchForCourse } = req.body || {};
+  const useCourseIds = Array.isArray(courseIds) && courseIds.length > 0;
+  const batchMap = batchForCourse && typeof batchForCourse === 'object' ? batchForCourse : {};
 
-  if (!leadId || !batchId || !payment) {
-    return res.status(400).json({ error: 'leadId, batchId, and payment are required' });
+  if (!leadId || !payment) {
+    return res.status(400).json({ error: 'leadId and payment are required' });
+  }
+  if (!useCourseIds && !batchId) {
+    return res.status(400).json({ error: 'Either batchId or courseIds (non-empty array) is required' });
   }
 
   const { amount, method, transactionRef } = payment;
@@ -730,41 +846,88 @@ app.post('/api/v1/enrollment/convert', async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    // 1. Load batch + course for capacity & code
-    const [batchRows] = await conn.query(
-      `
-      SELECT b.*, c.code AS course_code
-      FROM batches b
-      JOIN courses c ON b.course_id = c.id
-      WHERE b.id = ?
-      FOR UPDATE
-      `,
-      [batchId],
-    );
-
-    if (batchRows.length === 0) {
-      await conn.rollback();
-      conn.release();
-      return res.status(404).json({ error: 'Batch not found' });
+    // Resolve to list of batches: either [batchId] or one batch per courseId
+    let batchesToEnroll = [];
+    if (useCourseIds) {
+      for (const courseId of courseIds) {
+        const preferredBatchId = batchMap[courseId] || batchMap[String(courseId)];
+        let batchRows = [];
+        if (preferredBatchId) {
+          const [rows] = await conn.query(
+            `SELECT b.*, c.code AS course_code
+             FROM batches b JOIN courses c ON b.course_id = c.id
+             WHERE b.id = ? AND b.course_id = ?
+             FOR UPDATE`,
+            [preferredBatchId, courseId],
+          );
+          batchRows = rows;
+          if (batchRows.length > 0 && batchRows[0].current_enrollment >= batchRows[0].max_seats) {
+            await conn.rollback();
+            conn.release();
+            return res.status(422).json({
+              error: 'BATCH_FULL',
+              message: `Selected batch for course has no available seats.`,
+            });
+          }
+        }
+        if (batchRows.length === 0) {
+          const [rows] = await conn.query(
+            `
+            SELECT b.*, c.code AS course_code
+            FROM batches b
+            JOIN courses c ON b.course_id = c.id
+            WHERE b.course_id = ? AND b.current_enrollment < b.max_seats
+            ORDER BY b.start_date ASC
+            LIMIT 1
+            FOR UPDATE
+            `,
+            [courseId],
+          );
+          batchRows = rows;
+        }
+        if (batchRows.length === 0) {
+          await conn.rollback();
+          conn.release();
+          return res.status(422).json({
+            error: 'NO_BATCH',
+            message: `No batch with available seats for course ${courseId}.`,
+          });
+        }
+        batchesToEnroll.push(batchRows[0]);
+      }
+    } else {
+      const [batchRows] = await conn.query(
+        `
+        SELECT b.*, c.code AS course_code
+        FROM batches b
+        JOIN courses c ON b.course_id = c.id
+        WHERE b.id = ?
+        FOR UPDATE
+        `,
+        [batchId],
+      );
+      if (batchRows.length === 0) {
+        await conn.rollback();
+        conn.release();
+        return res.status(404).json({ error: 'Batch not found' });
+      }
+      if (batchRows[0].current_enrollment >= batchRows[0].max_seats) {
+        await conn.rollback();
+        conn.release();
+        return res.status(422).json({ error: 'BATCH_FULL', message: 'This batch is full.' });
+      }
+      batchesToEnroll = [batchRows[0]];
     }
 
-    const batch = batchRows[0];
-    if (batch.current_enrollment >= batch.max_seats) {
-      await conn.rollback();
-      conn.release();
-      return res.status(422).json({ error: 'BATCH_FULL', message: 'This batch is full.' });
-    }
-
-    // 2. Ensure lead exists
+    // Ensure lead exists
     const [leadRows] = await conn.query('SELECT * FROM leads WHERE id = ? LIMIT 1', [leadId]);
     if (leadRows.length === 0) {
       await conn.rollback();
       conn.release();
       return res.status(404).json({ error: 'Lead not found' });
     }
-    const lead = leadRows[0];
 
-    // 3. Record payment
+    // One payment for the conversion
     const paymentId = crypto.randomUUID();
     await conn.query(
       `
@@ -774,39 +937,80 @@ app.post('/api/v1/enrollment/convert', async (req, res) => {
       [paymentId, leadId, amount, method, transactionRef],
     );
 
-    // 4. Determine user_id for student (simplified: NULL or to be linked later)
-    // If you have a users-students mapping already, adjust this logic.
     const userId = null;
+    const created = [];
 
-    // 5. Generate enrollment number
-    const enrollmentNumber = await generateEnrollmentNumber(conn, batch.course_code);
-    const studentId = crypto.randomUUID();
+    const amountPerStudentForSchedule = totalFeeForSchedule != null && batchesToEnroll.length > 0
+      ? totalFeeForSchedule / batchesToEnroll.length
+      : (batchesToEnroll.length > 0 ? amount / batchesToEnroll.length : amount);
+    const today = new Date();
+    let instCount; let instMonths;
+    if (feePlanType === 'FULL') {
+      instCount = 1;
+      instMonths = 0;
+    } else if (feePlanType === 'MONTHLY') {
+      instCount = 12;
+      instMonths = 1;
+    } else {
+      instCount = 6;
+      instMonths = 2;
+    }
+    const perInst = Math.round((amountPerStudentForSchedule / instCount) * 100) / 100;
+
+    for (const batch of batchesToEnroll) {
+      const enrollmentNumber = await generateEnrollmentNumber(conn, batch.course_code);
+      const studentId = crypto.randomUUID();
+      await conn.query(
+        `
+        INSERT INTO students
+          (id, user_id, lead_id, batch_id, enrollment_number, enrollment_date, status)
+        VALUES (?, ?, ?, ?, ?, NOW(), 'ACTIVE')
+        `,
+        [studentId, userId, leadId, batch.id, enrollmentNumber],
+      );
+      await conn.query(
+        'UPDATE batches SET current_enrollment = current_enrollment + 1 WHERE id = ?',
+        [batch.id],
+      );
+      created.push({ studentId, enrollmentNumber, batchId: batch.id });
+
+      // Store payment timeline with selected plan; total is totalFee (or payment amount if not provided)
+      try {
+        const [fsIns] = await conn.query(
+          `INSERT INTO fee_schedules (student_id, lead_id, total_amount, plan_type) VALUES (?, ?, ?, ?)`,
+          [studentId, leadId, amountPerStudentForSchedule, feePlanType],
+        );
+        const scheduleId = fsIns.insertId;
+        for (let i = 0; i < instCount; i++) {
+          const d = new Date(today);
+          d.setMonth(d.getMonth() + i * instMonths);
+          const dueStr = d.toISOString().slice(0, 10);
+          await conn.query(
+            `INSERT INTO fee_installments (schedule_id, installment_no, due_date, amount_due, status) VALUES (?, ?, ?, ?, 'PENDING')`,
+            [scheduleId, i + 1, dueStr, perInst],
+          );
+        }
+      } catch (feeErr) {
+        // fee_schedules/fee_installments may not exist; don't fail enrollment
+        // eslint-disable-next-line no-console
+        console.warn('Could not create fee schedule for new student', feeErr.message);
+      }
+    }
 
     await conn.query(
-      `
-      INSERT INTO students
-        (id, user_id, lead_id, batch_id, enrollment_number, enrollment_date, status)
-      VALUES (?, ?, ?, ?, ?, NOW(), 'ACTIVE')
-      `,
-      [studentId, userId, leadId, batchId, enrollmentNumber],
+      'UPDATE leads SET status = ?, emergency_contact_number = ?, updated_at = NOW() WHERE id = ?',
+      ['CONVERTED', emergencyContactNumber || null, leadId],
     );
-
-    // 6. Update batch counter & lead status
-    await conn.query(
-      'UPDATE batches SET current_enrollment = current_enrollment + 1 WHERE id = ?',
-      [batchId],
-    );
-
-    await conn.query('UPDATE leads SET status = ? WHERE id = ?', ['CONVERTED', leadId]);
 
     await conn.commit();
     conn.release();
 
     return res.status(201).json({
       success: true,
-      studentId,
-      enrollmentNumber,
       paymentId,
+      students: created,
+      studentId: created[0]?.studentId,
+      enrollmentNumber: created[0]?.enrollmentNumber,
     });
   } catch (err) {
     await conn.rollback();
@@ -852,6 +1056,7 @@ app.get('/api/v1/students', async (req, res) => {
     );
     const total = Number(countRow?.total ?? 0);
 
+    // Main list without fee subquery (works even if fee tables don't exist)
     const [rows] = await pool.query(
       `
       SELECT
@@ -876,11 +1081,52 @@ app.get('/api/v1/students', async (req, res) => {
       [...params, limit, offset],
     );
 
-    return res.json({ data: rows, page: Number(page), pageSize: limit, total });
+    // Add next_fee_payment_date if fee tables exist (don't fail list if they don't)
+    let rowsWithFeeDate = rows;
+    try {
+      const studentIds = (rows || []).map((r) => r.id);
+      if (studentIds.length > 0) {
+        const placeholders = studentIds.map(() => '?').join(',');
+        const [feeRows] = await pool.query(
+          `SELECT f.student_id,
+                  MIN(i.due_date) AS next_fee_payment_date,
+                  SUBSTRING_INDEX(GROUP_CONCAT(i.amount_due ORDER BY i.due_date ASC, i.id), ',', 1) AS next_fee_payment_amount
+           FROM fee_installments i
+           JOIN fee_schedules f ON i.schedule_id = f.id
+           WHERE f.student_id IN (${placeholders}) AND i.status = 'PENDING'
+           GROUP BY f.student_id`,
+          studentIds,
+        );
+        const feeByStudent = {};
+        (feeRows || []).forEach((row) => {
+          const sid = row.student_id != null ? String(row.student_id) : row.student_id;
+          feeByStudent[sid] = {
+            date: row.next_fee_payment_date,
+            amount: row.next_fee_payment_amount != null ? Number(row.next_fee_payment_amount) : null,
+          };
+        });
+        rowsWithFeeDate = (rows || []).map((r) => {
+          const fee = feeByStudent[String(r.id)];
+          return {
+            ...r,
+            next_fee_payment_date: fee?.date ?? null,
+            next_fee_payment_amount: fee?.amount ?? null,
+          };
+        });
+      }
+    } catch (feeErr) {
+      // fee_schedules/fee_installments may not exist; leave next fee fields null
+      rowsWithFeeDate = (rows || []).map((r) => ({ ...r, next_fee_payment_date: null, next_fee_payment_amount: null }));
+    }
+
+    return res.json({ data: rowsWithFeeDate, page: Number(page), pageSize: limit, total });
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('List students failed', err);
-    return res.status(500).json({ error: 'Failed to list students' });
+    return res.status(500).json({
+      error: 'Failed to list students',
+      detail: err && err.message ? err.message : undefined,
+    });
   }
 });
 
@@ -900,7 +1146,9 @@ app.get('/api/v1/students/:id', async (req, res) => {
         l.full_name AS lead_name,
         l.email AS lead_email,
         l.phone_number AS lead_phone,
+        l.emergency_contact_number AS lead_emergency_contact_number,
         b.name AS batch_name,
+        b.course_id AS batch_course_id,
         b.start_date,
         c.name AS course_name,
         c.code AS course_code
@@ -934,7 +1182,280 @@ app.get('/api/v1/students/:id', async (req, res) => {
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('Get student detail failed', err);
-    return res.status(500).json({ error: 'Failed to fetch student detail' });
+    return res.status(500).json({
+      error: 'Failed to fetch student detail',
+      detail: err && err.message ? err.message : undefined,
+    });
+  }
+});
+
+// Update student (status, batch) and linked lead (name, email, phone, emergency contact)
+app.patch('/api/v1/students/:id', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized. Check DB_* env vars.' });
+  }
+  const { id } = req.params;
+  const {
+    status,
+    batchId,
+    fullName,
+    email,
+    phoneNumber,
+    emergencyContactNumber,
+  } = req.body || {};
+  const leadFields = {
+    fullName: fullName != null ? String(fullName).trim() : undefined,
+    email: email != null ? String(email).trim() || null : undefined,
+    phoneNumber: phoneNumber != null ? String(phoneNumber).trim() : undefined,
+    emergencyContactNumber: emergencyContactNumber != null ? String(emergencyContactNumber).trim() || null : undefined,
+  };
+  try {
+    const [studentRows] = await pool.query('SELECT id, lead_id FROM students WHERE id = ? LIMIT 1', [id]);
+    if (studentRows.length === 0) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+    const leadId = studentRows[0].lead_id;
+
+    const studentUpdates = [];
+    const studentParams = [];
+    if (status !== undefined) {
+      const valid = ['ACTIVE', 'DROPPED', 'COMPLETED'];
+      if (!valid.includes(status)) {
+        return res.status(400).json({ error: 'status must be ACTIVE, DROPPED, or COMPLETED' });
+      }
+      studentUpdates.push('status = ?');
+      studentParams.push(status);
+    }
+    if (batchId !== undefined) {
+      const [batchRows] = await pool.query('SELECT id FROM batches WHERE id = ?', [batchId]);
+      if (batchRows.length === 0) {
+        return res.status(400).json({ error: 'Batch not found' });
+      }
+      studentUpdates.push('batch_id = ?');
+      studentParams.push(batchId);
+    }
+
+    if (leadFields.fullName !== undefined || leadFields.email !== undefined || leadFields.phoneNumber !== undefined || leadFields.emergencyContactNumber !== undefined) {
+      const leadUpdates = [];
+      const leadParams = [];
+      if (leadFields.fullName !== undefined) {
+        leadUpdates.push('full_name = ?');
+        leadParams.push(leadFields.fullName);
+      }
+      if (leadFields.email !== undefined) {
+        leadUpdates.push('email = ?');
+        leadParams.push(leadFields.email);
+      }
+      if (leadFields.phoneNumber !== undefined) {
+        leadUpdates.push('phone_number = ?');
+        leadParams.push(leadFields.phoneNumber);
+      }
+      if (leadFields.emergencyContactNumber !== undefined) {
+        leadUpdates.push('emergency_contact_number = ?');
+        leadParams.push(leadFields.emergencyContactNumber);
+      }
+      if (leadUpdates.length > 0) {
+        leadParams.push(leadId);
+        await pool.query(
+          `UPDATE leads SET ${leadUpdates.join(', ')}, updated_at = NOW() WHERE id = ?`,
+          leadParams,
+        );
+      }
+    }
+
+    if (studentUpdates.length > 0) {
+      studentParams.push(id);
+      const [result] = await pool.query(
+        `UPDATE students SET ${studentUpdates.join(', ')} WHERE id = ?`,
+        studentParams,
+      );
+      if (!result.affectedRows) {
+        return res.status(404).json({ error: 'Student not found' });
+      }
+    }
+
+    const [rows] = await pool.query(
+      `SELECT s.*, l.full_name AS lead_name, l.email AS lead_email, l.phone_number AS lead_phone,
+              l.emergency_contact_number AS lead_emergency_contact_number,
+              b.name AS batch_name, b.course_id AS batch_course_id,
+              c.name AS course_name, c.code AS course_code
+       FROM students s
+       JOIN leads l ON s.lead_id = l.id
+       JOIN batches b ON s.batch_id = b.id
+       JOIN courses c ON b.course_id = c.id
+       WHERE s.id = ?`,
+      [id],
+    );
+    return res.json(rows[0]);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('Update student failed', err);
+    return res.status(500).json({ error: 'Failed to update student' });
+  }
+});
+
+// Fee schedule: get schedule with installments for a student
+app.get('/api/v1/students/:id/fee-schedule', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized.' });
+  }
+
+  const { id } = req.params;
+
+  try {
+    const [schedRows] = await pool.query(
+      `SELECT * FROM fee_schedules WHERE student_id = ? ORDER BY created_at DESC LIMIT 1`,
+      [id],
+    );
+
+    if (schedRows.length === 0) {
+      return res.json({ schedule: null, installments: [] });
+    }
+
+    const schedule = schedRows[0];
+    const [instRows] = await pool.query(
+      `SELECT * FROM fee_installments WHERE schedule_id = ? ORDER BY installment_no`,
+      [schedule.id],
+    );
+
+    return res.json({ schedule, installments: instRows });
+  } catch (err) {
+    console.error('Get fee schedule failed', err);
+    return res.status(500).json({ error: 'Failed to fetch fee schedule' });
+  }
+});
+
+// Fee schedule: create schedule and installments
+app.post('/api/v1/students/:id/fee-schedule', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized.' });
+  }
+
+  const { id } = req.params;
+  const { totalAmount, planType } = req.body;
+
+  if (!totalAmount || !planType) {
+    return res.status(400).json({ error: 'totalAmount and planType are required.' });
+  }
+
+  const valid = ['FULL', 'MONTHLY', 'INSTALLMENT_6'];
+  if (!valid.includes(planType)) {
+    return res.status(400).json({ error: 'planType must be FULL, MONTHLY, or INSTALLMENT_6.' });
+  }
+
+  const amount = parseFloat(totalAmount);
+  if (isNaN(amount) || amount <= 0) {
+    return res.status(400).json({ error: 'totalAmount must be a positive number.' });
+  }
+
+  try {
+    const [stRows] = await pool.query(
+      `SELECT id, lead_id FROM students WHERE id = ? LIMIT 1`,
+      [id],
+    );
+    if (stRows.length === 0) {
+      return res.status(404).json({ error: 'Student not found.' });
+    }
+    const { lead_id } = stRows[0];
+
+    const [existing] = await pool.query(
+      `SELECT id FROM fee_schedules WHERE student_id = ?`,
+      [id],
+    );
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'A fee schedule already exists for this student.' });
+    }
+
+    const [ins] = await pool.query(
+      `INSERT INTO fee_schedules (student_id, lead_id, total_amount, plan_type) VALUES (?, ?, ?, ?)`,
+      [id, lead_id, amount, planType],
+    );
+    const scheduleId = ins.insertId;
+
+    const installments = [];
+    let count; let months;
+    if (planType === 'FULL') {
+      count = 1;
+      months = 0;
+    } else if (planType === 'MONTHLY') {
+      count = 12;
+      months = 1;
+    } else {
+      count = 6;
+      months = 2;
+    }
+
+    const perInst = Math.round((amount / count) * 100) / 100;
+    const today = new Date();
+
+    for (let i = 0; i < count; i++) {
+      const d = new Date(today);
+      d.setMonth(d.getMonth() + i * months);
+      const dueDate = d.toISOString().slice(0, 10);
+      await pool.query(
+        `INSERT INTO fee_installments (schedule_id, installment_no, due_date, amount_due, status) VALUES (?, ?, ?, ?, 'PENDING')`,
+        [scheduleId, i + 1, dueDate, perInst],
+      );
+      installments.push({ installment_no: i + 1, due_date: dueDate, amount_due: perInst, status: 'PENDING' });
+    }
+
+    const [schedRow] = await pool.query(`SELECT * FROM fee_schedules WHERE id = ?`, [scheduleId]);
+    return res.status(201).json({ schedule: schedRow[0], installments });
+  } catch (err) {
+    console.error('Create fee schedule failed', err);
+    return res.status(500).json({ error: 'Failed to create fee schedule' });
+  }
+});
+
+// Record payment for an installment
+app.post('/api/v1/students/:studentId/fee-installments/:installmentId/pay', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized.' });
+  }
+
+  const { studentId, installmentId } = req.params;
+  const { amount, method, transactionRef } = req.body;
+
+  if (!amount || !transactionRef) {
+    return res.status(400).json({ error: 'amount and transactionRef are required.' });
+  }
+
+  const pm = (method || 'CASH').toUpperCase();
+  const validMethods = ['CASH', 'STRIPE', 'RAZORPAY', 'BANK_TRANSFER'];
+  const payMethod = validMethods.includes(pm) ? pm : 'CASH';
+
+  try {
+    const [inst] = await pool.query(
+      `SELECT i.*, s.lead_id FROM fee_installments i
+       JOIN fee_schedules s ON i.schedule_id = s.id
+       WHERE i.id = ? AND s.student_id = ?`,
+      [installmentId, studentId],
+    );
+    if (inst.length === 0) {
+      return res.status(404).json({ error: 'Installment not found.' });
+    }
+    const row = inst[0];
+    if (row.status === 'PAID') {
+      return res.status(400).json({ error: 'Installment is already paid.' });
+    }
+
+    const paymentUuid = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO payments (id, lead_id, amount, currency, payment_method, transaction_ref, status, invoice_url, created_at)
+       VALUES (?, ?, ?, 'USD', ?, ?, 'COMPLETED', NULL, NOW())`,
+      [paymentUuid, row.lead_id, parseFloat(amount), payMethod, transactionRef.trim()],
+    );
+
+    await pool.query(
+      `UPDATE fee_installments SET status = 'PAID', paid_at = NOW(), payment_id = ? WHERE id = ?`,
+      [paymentUuid, installmentId],
+    );
+
+    const [updated] = await pool.query(`SELECT * FROM fee_installments WHERE id = ?`, [installmentId]);
+    return res.json({ installment: updated[0], paymentId: paymentUuid });
+  } catch (err) {
+    console.error('Record installment payment failed', err);
+    return res.status(500).json({ error: 'Failed to record payment' });
   }
 });
 
@@ -952,11 +1473,127 @@ app.get('/api/v1/courses', async (req, res) => {
       ORDER BY name
       `,
     );
-    return res.json({ data: rows });
+    // Normalize id to string (MySQL may return UUID as Buffer or different format)
+    const data = (rows || []).map((r) => ({
+      ...r,
+      id: r.id != null ? String(r.id) : r.id,
+    }));
+    return res.json({ data });
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('List courses failed', err);
     return res.status(500).json({ error: 'Failed to list courses' });
+  }
+});
+
+// Create course
+app.post('/api/v1/courses', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized. Check DB_* env vars.' });
+  }
+  const { name, code, baseFee, isActive } = req.body || {};
+  if (!name || !code) {
+    return res.status(400).json({ error: 'name and code are required' });
+  }
+  const id = crypto.randomUUID();
+  const baseFeeVal = baseFee != null ? Number(baseFee) : 0;
+  const isActiveVal = isActive !== false;
+  const nameVal = String(name).trim();
+  const codeVal = String(code).trim().toUpperCase();
+  const isActiveNum = isActiveVal ? 1 : 0;
+
+  try {
+    await pool.query(
+      `INSERT INTO courses (id, name, code, base_fee, is_active) VALUES (?, ?, ?, ?, ?)`,
+      [id, nameVal, codeVal, baseFeeVal, isActiveNum],
+    );
+    return res.status(201).json({ id, name: nameVal, code: codeVal, base_fee: baseFeeVal, is_active: isActiveVal });
+  } catch (err) {
+    if (err && err.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: 'Course code already exists' });
+    }
+    // If table has Prisma-style camelCase columns (baseFee, isActive), try that
+    const badField = err && err.code === 'ER_BAD_FIELD_ERROR' || (err.message && err.message.includes('Unknown column'));
+    if (badField) {
+      try {
+        await pool.query(
+          `INSERT INTO courses (id, name, code, baseFee, isActive) VALUES (?, ?, ?, ?, ?)`,
+          [id, nameVal, codeVal, baseFeeVal, isActiveNum],
+        );
+        return res.status(201).json({ id, name: nameVal, code: codeVal, base_fee: baseFeeVal, is_active: isActiveVal });
+      } catch (err2) {
+        // eslint-disable-next-line no-console
+        console.error('Create course failed (snake_case and camelCase)', err, err2);
+        return res.status(500).json({
+          error: 'Failed to create course',
+          detail: err2.message || err.message || String(err2),
+        });
+      }
+    }
+    // eslint-disable-next-line no-console
+    console.error('Create course failed', err);
+    return res.status(500).json({
+      error: 'Failed to create course',
+      detail: err.message || err.code || String(err),
+    });
+  }
+});
+
+// Update course
+app.patch('/api/v1/courses/:id', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized. Check DB_* env vars.' });
+  }
+  const { id } = req.params;
+  const { name, code, baseFee, isActive } = req.body || {};
+  try {
+    const updates = [];
+    const params = [];
+    if (name !== undefined) { updates.push('name = ?'); params.push(String(name).trim()); }
+    if (code !== undefined) { updates.push('code = ?'); params.push(String(code).trim().toUpperCase()); }
+    if (baseFee !== undefined) { updates.push('base_fee = ?'); params.push(Number(baseFee)); }
+    if (isActive !== undefined) { updates.push('is_active = ?'); params.push(isActive ? 1 : 0); }
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    params.push(id);
+    const [result] = await pool.query(
+      `UPDATE courses SET ${updates.join(', ')} WHERE id = ?`,
+      params,
+    );
+    if (!result.affectedRows) {
+      return res.status(404).json({ error: 'Course not found' });
+    }
+    const [rows] = await pool.query('SELECT id, name, code, base_fee, is_active FROM courses WHERE id = ?', [id]);
+    return res.json(rows[0]);
+  } catch (err) {
+    if (err && err.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: 'Course code already exists' });
+    }
+    console.error('Update course failed', err);
+    return res.status(500).json({ error: 'Failed to update course' });
+  }
+});
+
+// Delete course
+app.delete('/api/v1/courses/:id', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized. Check DB_* env vars.' });
+  }
+  const { id } = req.params;
+  try {
+    const [batchCount] = await pool.query('SELECT COUNT(*) AS n FROM batches WHERE course_id = ?', [id]);
+    if (batchCount[0].n > 0) {
+      return res.status(422).json({ error: 'Cannot delete course that has batches. Delete or reassign batches first.' });
+    }
+    const [result] = await pool.query('DELETE FROM courses WHERE id = ?', [id]);
+    if (!result.affectedRows) {
+      return res.status(404).json({ error: 'Course not found' });
+    }
+    return res.status(204).send();
+  } catch (err) {
+    console.error('Delete course failed', err);
+    return res.status(500).json({ error: 'Failed to delete course' });
   }
 });
 
@@ -1040,6 +1677,119 @@ app.get('/api/v1/batches/:id', async (req, res) => {
   }
 });
 
+// Create batch
+app.post('/api/v1/batches', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized. Check DB_* env vars.' });
+  }
+  const { courseId, name, startDate, maxSeats, status } = req.body || {};
+  if (!courseId || !name || !startDate || maxSeats == null) {
+    return res.status(400).json({ error: 'courseId, name, startDate, and maxSeats are required' });
+  }
+  const courseIdTrimmed = String(courseId).trim();
+  const maxSeatsNum = Math.max(0, Number(maxSeats));
+  const batchStatus = ['OPEN', 'FULL', 'IN_PROGRESS', 'COMPLETED'].includes(status) ? status : 'OPEN';
+  try {
+    let [courseRows] = await pool.query('SELECT id FROM courses WHERE id = ?', [courseIdTrimmed]);
+    if (courseRows.length === 0) {
+      // Fallback: MySQL may return UUID as Buffer or different type; fetch all and match as string
+      const [allCourses] = await pool.query('SELECT id FROM courses');
+      const matched = (allCourses || []).find((c) => String(c.id) === courseIdTrimmed);
+      if (matched) {
+        courseRows = [matched];
+      }
+    }
+    if (courseRows.length === 0) {
+      // eslint-disable-next-line no-console
+      console.error('Create batch: course not found. courseId=', courseIdTrimmed, 'courses table check: run SELECT id FROM courses;');
+      return res.status(422).json({
+        error: 'Course not found',
+        message: 'The selected course was not found in the database. Ensure you have at least one course (Courses page → Add course) and that you selected it in the dropdown.',
+      });
+    }
+    const resolvedCourseId = courseRows[0].id != null ? String(courseRows[0].id) : courseIdTrimmed;
+    const id = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO batches (id, course_id, name, start_date, max_seats, current_enrollment, status)
+       VALUES (?, ?, ?, ?, ?, 0, ?)`,
+      [id, resolvedCourseId, String(name).trim(), startDate, maxSeatsNum, batchStatus],
+    );
+    const [rows] = await pool.query(
+      `SELECT b.*, c.name AS course_name, c.code AS course_code
+       FROM batches b JOIN courses c ON b.course_id = c.id WHERE b.id = ?`,
+      [id],
+    );
+    return res.status(201).json(rows[0]);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('Create batch failed', err);
+    return res.status(500).json({ error: 'Failed to create batch' });
+  }
+});
+
+// Update batch
+app.patch('/api/v1/batches/:id', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized. Check DB_* env vars.' });
+  }
+  const { id } = req.params;
+  const { name, startDate, maxSeats, status } = req.body || {};
+  try {
+    const updates = [];
+    const params = [];
+    if (name !== undefined) { updates.push('name = ?'); params.push(String(name).trim()); }
+    if (startDate !== undefined) { updates.push('start_date = ?'); params.push(startDate); }
+    if (maxSeats !== undefined) { updates.push('max_seats = ?'); params.push(Math.max(0, Number(maxSeats))); }
+    if (status !== undefined && ['OPEN', 'FULL', 'IN_PROGRESS', 'COMPLETED'].includes(status)) {
+      updates.push('status = ?'); params.push(status);
+    }
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    params.push(id);
+    const [result] = await pool.query(
+      `UPDATE batches SET ${updates.join(', ')} WHERE id = ?`,
+      params,
+    );
+    if (!result.affectedRows) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+    const [rows] = await pool.query(
+      `SELECT b.*, c.name AS course_name, c.code AS course_code
+       FROM batches b JOIN courses c ON b.course_id = c.id WHERE b.id = ?`,
+      [id],
+    );
+    return res.json(rows[0]);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('Update batch failed', err);
+    return res.status(500).json({ error: 'Failed to update batch' });
+  }
+});
+
+// Delete batch
+app.delete('/api/v1/batches/:id', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized. Check DB_* env vars.' });
+  }
+  const { id } = req.params;
+  try {
+    const [studentCount] = await pool.query('SELECT COUNT(*) AS n FROM students WHERE batch_id = ?', [id]);
+    if (studentCount[0].n > 0) {
+      return res.status(422).json({ error: 'Cannot delete batch that has enrolled students. Remove students first.' });
+    }
+    const [result] = await pool.query('DELETE FROM batches WHERE id = ?', [id]);
+    if (!result.affectedRows) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+    return res.status(204).send();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('Delete batch failed', err);
+    return res.status(500).json({ error: 'Failed to delete batch' });
+  }
+});
+
 // =========================
 // Module 3 – Attendance
 // =========================
@@ -1077,17 +1827,24 @@ app.get('/api/v1/batches/:id/students', async (req, res) => {
   }
 });
 
-// Create attendance session
+// Create attendance session (teacher_id = logged-in user; must exist in users table)
 app.post('/api/v1/attendance/sessions', async (req, res) => {
   if (!pool) {
     return res.status(500).json({ error: 'Database pool not initialized. Check DB_* env vars.' });
   }
 
-  const { batchId, teacherId, date, subject, startTime, endTime } = req.body || {};
+  const teacherId = req.user?.userId || req.user?.id;
+  if (!teacherId) {
+    return res.status(401).json({
+      error: 'You must be logged in to create an attendance session. teacher_id must reference a user.',
+    });
+  }
 
-  if (!batchId || !teacherId || !date || !subject || !startTime || !endTime) {
+  const { batchId, date, subject, startTime, endTime } = req.body || {};
+
+  if (!batchId || !date || !subject || !startTime || !endTime) {
     return res.status(400).json({
-      error: 'batchId, teacherId, date, subject, startTime, and endTime are required',
+      error: 'batchId, date, subject, startTime, and endTime are required',
     });
   }
 
@@ -1372,6 +2129,92 @@ app.post('/api/v1/telegram/connect-link', async (req, res) => {
     // eslint-disable-next-line no-console
     console.error('Generate Telegram connect link failed', err);
     return res.status(500).json({ error: 'Failed to generate connect link' });
+  }
+});
+
+// Send a Telegram notification to a connected student
+// type: EXAM_RESULT | FEES | CUSTOM
+app.post('/api/v1/telegram/send', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database pool not initialized. Check DB_* env vars.' });
+  }
+
+  const { studentId, type, message } = req.body || {};
+
+  const allowedTypes = ['EXAM_RESULT', 'FEES', 'CUSTOM'];
+  if (!studentId || !type || !allowedTypes.includes(type)) {
+    return res.status(400).json({ error: 'studentId and valid type (EXAM_RESULT, FEES, CUSTOM) are required' });
+  }
+
+  if (type === 'CUSTOM' && (!message || !String(message).trim())) {
+    return res.status(400).json({ error: 'Custom message is required for CUSTOM type' });
+  }
+
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (!botToken) {
+    return res.status(500).json({ error: 'TELEGRAM_BOT_TOKEN is not configured on the server' });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      `
+      SELECT
+        tm.*,
+        s.lead_id,
+        l.full_name,
+        l.email
+      FROM telegram_mappings tm
+      JOIN students s ON tm.student_id = s.id
+      JOIN leads l ON s.lead_id = l.id
+      WHERE tm.student_id = ? AND tm.is_active = 1 AND tm.chat_id IS NOT NULL
+      LIMIT 1
+      `,
+      [studentId],
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'No active Telegram mapping found for this student. Ask them to connect Telegram first.' });
+    }
+
+    const mapping = rows[0];
+    const name = mapping.full_name || 'Student';
+
+    let text;
+    if (type === 'CUSTOM') {
+      text = String(message).trim();
+    } else if (type === 'EXAM_RESULT') {
+      text = `Hi ${name}, your latest exam results are available in the portal. Please log in to check your marks and feedback.`;
+    } else if (type === 'FEES') {
+      text = `Hi ${name}, this is a reminder about your course fee payment. Please check your portal for the next due date and amount.`;
+    }
+
+    if (typeof fetch !== 'function') {
+      // eslint-disable-next-line no-console
+      console.error('Global fetch is not available in this Node version.');
+      return res.status(500).json({ error: 'Telegram send is not supported on this server runtime (no fetch)' });
+    }
+
+    const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: mapping.chat_id,
+        text,
+      }),
+    });
+
+    const tgJson = await tgRes.json().catch(() => ({}));
+    if (!tgRes.ok || tgJson.ok === false) {
+      // eslint-disable-next-line no-console
+      console.error('Telegram send failed', tgJson);
+      return res.status(502).json({ error: 'Failed to send Telegram message' });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('Send Telegram notification failed', err);
+    return res.status(500).json({ error: 'Failed to send Telegram notification' });
   }
 });
 
